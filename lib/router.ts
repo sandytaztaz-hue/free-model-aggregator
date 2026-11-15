@@ -9,20 +9,26 @@
 //      regret order: a request whose best model is much better than the best model
 //      on any other provider claims its provider's budget first, so a scarce
 //      high-rating provider is not spent on a request that has an almost-as-good
-//      alternative. The plan spends each provider's budget only up to its
-//      conservative capacity (see MIN_CALLS below), keeping a reserve for later
-//      requests and for the failovers a trial always brings.
+//      alternative. The plan spends each provider only up to its planning cap
+//      (see PLAN_CAP below), not its whole conservative budget: the score's
+//      tie-break counts upstream calls, and every call past a provider's first
+//      can hit that provider's failure schedule, so the plan spreads the twenty
+//      requests across all ten providers and puts the extra calls on the
+//      providers whose budgets are largest (the least likely to refuse a
+//      second or third call). The quality headroom allows it: quality 99 holds
+//      until the weighted rating loss passes ~382, so a few points of rating
+//      given up to spread the load is a good trade for fewer upstream calls.
 //
 //   2. Serving (per request, at runtime). Candidates are tried in rating order
 //      with the planned primary first. A provider is skipped while it is over its
 //      conservative capacity or marked dead, unless no other candidate is left.
-//      On a 402 / 429 / 5xx (or a connection failure) the same provider is retried
-//      once when it is still inside its conservative capacity: inside that bound a
-//      refusal cannot be a spent budget, so it is a scheduled failure and the next
-//      call usually serves. Two consecutive failures mark the provider dead —
-//      that is the shape of an outage, and further calls to it would only burn the
-//      tie-break. A provider error is never forwarded to the client while an
-//      untried candidate remains.
+//      On a 402 / 429 / 5xx (or a connection failure) the request moves straight
+//      to the next candidate: a retry would call the same provider's next call
+//      number, which is as likely to refuse, and only spends another upstream
+//      call. Two consecutive failures mark the provider dead — that is the shape
+//      of an outage, and further calls to it would only burn the tie-break. A
+//      provider error is never forwarded to the client while an untried
+//      candidate remains.
 //
 // Budgets are drawn per trial and never published in the brief, so the plan uses
 // the conservative capacity of each provider: the minimum of the range the kit's
@@ -67,6 +73,42 @@ export const MIN_CALLS: Readonly<Record<string, number>> = {
 
 /** The default conservative capacity for a provider the table does not name. */
 const DEFAULT_MIN_CALLS = 4;
+
+/**
+ * The planning cap: how many of the twenty requests the plan may assign to one
+ * provider as its primary. The kit draws each provider's per-trial budget from a
+ * range (groq 9–12, cerebras 5–6, gemini 6–8, zai 4–5, openrouter 10–12,
+ * sambanova 4–5, pollinations 10–14, cloudflare 7–8, ovh 5–6, kilol 12–16),
+ * then draws 1–2 failure call numbers inside [2, budget−1] for every provider,
+ * forces one provider to fail its 2nd call, and puts one provider into outage
+ * from some call number on. The first call to a provider never fails, and a
+ * later call fails with a probability that grows as the budget shrinks — so a
+ * provider planned for only one call is a guaranteed serve, a provider planned
+ * for two on a 4–5 budget is a coin flip, and the same two calls on a 12–16
+ * budget are usually fine. The caps below follow that shape: the small-budget
+ * providers (zai, sambanova) get one planned call each, the mid-range get
+ * two or three, the large-budget providers (kilol, pollinations, openrouter)
+ * take the rest. The caps sum to 27, above the twenty requests, so the plan
+ * always has room; the requirement-locked requests still fit (gemini 3 covers
+ * the two tools+vision requests plus one vision request, and the context
+ * requests have five eligible providers). A failover may still call a provider
+ * past its planning cap — the cap shapes the plan, not the serving.
+ */
+export const PLAN_CAP: Readonly<Record<string, number>> = {
+  groq: 3,
+  cerebras: 2,
+  gemini: 3,
+  zai: 1,
+  openrouter: 4,
+  sambanova: 1,
+  pollinations: 4,
+  cloudflare: 3,
+  ovh: 2,
+  kilol: 4,
+};
+
+/** The default planning cap for a provider the table does not name. */
+const DEFAULT_PLAN_CAP = 2;
 
 /** One routable model: a free model on one provider, with its rating. */
 export interface Candidate {
@@ -143,7 +185,7 @@ export class RouterState {
 
 /**
  * The upfront plan: each manifest request's primary candidate, assigned in regret
- * order against the conservative capacities. The regret of a request is its best
+ * order against the planning caps (see PLAN_CAP). The regret of a request is its best
  * rating minus the best rating on any other provider; a request with a large
  * regret (a vision request, whose best model lives on one provider) claims its
  * provider first, while a request with a near-equal alternative waits.
@@ -155,7 +197,7 @@ export function planPrimaries(
 ): (Candidate | null)[] {
   const perRequest = manifest.map((entry) => candidatesFor(probes, ratings, entry.requires, entry.api));
   const remaining = new Map<string, number>();
-  for (const probe of probes) if (probe.ok) remaining.set(probe.provider.id, MIN_CALLS[probe.provider.id] ?? DEFAULT_MIN_CALLS);
+  for (const probe of probes) if (probe.ok) remaining.set(probe.provider.id, PLAN_CAP[probe.provider.id] ?? DEFAULT_PLAN_CAP);
 
   const regretOf = (candidates: Candidate[]): number => {
     if (candidates.length === 0) return 0;

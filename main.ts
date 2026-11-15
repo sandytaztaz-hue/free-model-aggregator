@@ -26,13 +26,14 @@
 // body's catalog must be that same document. Build it once, as this file does, and use the one object.
 //
 // Routing: every request's free candidates are ranked by the sealed quality table's
-// rating_milli (see lib/router.ts), planned against each provider's conservative
-// per-trial budget with the scarce providers reserved for the requests that need
+// rating_milli (see lib/router.ts), planned against each provider's risk-aware
+// per-trial call cap with the scarce providers reserved for the requests that need
 // them most, and tried in that order. A provider that refuses (402, 429, 5xx, or
-// unreachable) is retried once while it is still inside its conservative budget —
-// inside that bound a refusal is a scheduled failure, not a spent budget — and
-// then the request moves to the next-best free model that meets it. A provider
-// error is never forwarded to the client while an untried candidate remains.
+// unreachable) is never retried for that request — a retry would call the same
+// provider's next call number, which is as likely to refuse, and only spends
+// another upstream call — the request moves straight to the next-best free model
+// that meets it. A provider error is never forwarded to the client while an
+// untried candidate remains.
 //
 // Every choice is a function of the brief, the requests and the providers'
 // answers: no clock, no unseeded randomness, so a replay leaves the same state
@@ -355,9 +356,7 @@ async function serve(req: IncomingMessage, res: ServerResponse, clientApi: 'open
   const candidates = candidatesFor(probes, brief.ratings, requires, clientApi);
   const primary = index >= 0 && index < primaries.length ? primaries[index] : null;
   const ordered = orderAttempts(attemptOrder(primary, candidates), router);
-  const retried = new Set<string>();
   for (const candidate of ordered) {
-    const key = `${candidate.providerId}/${candidate.model.id}`;
     const result = await callUpstream(candidate, canonical, stream);
     if (result.ok) {
       if (await answerClient(res, clientApi, candidate, result.text, stream)) return;
@@ -366,22 +365,14 @@ async function serve(req: IncomingMessage, res: ServerResponse, clientApi: 'open
       noteMalformed(candidate.providerId);
       continue;
     }
-    // A refusal: retry the same provider once while it is still inside its
-    // conservative budget. Inside that bound a refusal cannot be a spent budget,
-    // so it is a scheduled failure and the next call usually serves.
-    if (
-      !retried.has(key) &&
-      !router.dead.has(candidate.providerId) &&
-      router.callsOf(candidate.providerId) < router.capacityOf(candidate.providerId)
-    ) {
-      retried.add(key);
-      const retry = await callUpstream(candidate, canonical, stream);
-      if (retry.ok) {
-        if (await answerClient(res, clientApi, candidate, retry.text, stream)) return;
-        noteMalformed(candidate.providerId);
-        continue;
-      }
-    }
+    // A refusal: never retry the same provider for this request. A refusal
+    // here is a scheduled failure, a spent budget or an outage, and the same
+    // provider's next call number is as likely to refuse as this one was, so
+    // a retry only spends another upstream call; move straight to the next
+    // candidate instead. (An earlier version retried once: on the practice
+    // trials the retry itself refused whenever the next call number was also
+    // on the provider's failure schedule, turning one extra call into two.)
+    continue;
   }
   sendError(
     res,
