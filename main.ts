@@ -104,6 +104,21 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 /** The router's live state: calls made per provider, and which providers look dead. */
 const router = new RouterState();
+/** Consecutive malformed 2xx answers per provider: two in a row mark it dead, like any other failure. */
+const malformedStreaks = new Map<string, number>();
+
+/**
+ * Record a 2xx answer that is not a well-formed answer of its wire. It already
+ * counted as a successful call against the provider's budget (callUpstream noted
+ * it so), so this only moves the failure streak: two malformed answers in a row
+ * mark the provider dead for the rest of the trial, instead of leaving a
+ * provider that only ever answers garbage looking healthy forever.
+ */
+function noteMalformed(providerId: string): void {
+  const streak = (malformedStreaks.get(providerId) ?? 0) + 1;
+  malformedStreaks.set(providerId, streak);
+  if (streak >= 2) router.dead.add(providerId);
+}
 /** Each manifest request's planned primary candidate, assigned at startup. */
 let primaries: (Candidate | null)[] = [];
 
@@ -346,7 +361,9 @@ async function serve(req: IncomingMessage, res: ServerResponse, clientApi: 'open
     const result = await callUpstream(candidate, canonical, stream);
     if (result.ok) {
       if (await answerClient(res, clientApi, candidate, result.text, stream)) return;
-      // A 2xx that is not a well-formed answer of its wire: treat it as a failed attempt.
+      // A 2xx that is not a well-formed answer of its wire: treat it as a failed attempt,
+      // and count it toward marking the provider dead so garbage answers fail over fast.
+      noteMalformed(candidate.providerId);
       continue;
     }
     // A refusal: retry the same provider once while it is still inside its
@@ -361,6 +378,7 @@ async function serve(req: IncomingMessage, res: ServerResponse, clientApi: 'open
       const retry = await callUpstream(candidate, canonical, stream);
       if (retry.ok) {
         if (await answerClient(res, clientApi, candidate, retry.text, stream)) return;
+        noteMalformed(candidate.providerId);
         continue;
       }
     }
